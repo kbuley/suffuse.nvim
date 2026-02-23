@@ -343,11 +343,19 @@ function Client:_process_watch_body()
   for _, line in ipairs(lines) do
     local msg, err = proto.unwrap_watch(line)
     if err then
-      vim.notify('[suffuse] watch: ' .. err, vim.log.levels.DEBUG)
-    elseif msg and msg.items then
-      local text = proto.text_from_items(msg.items)
-      if text and self.on_clipboard then
-        vim.schedule(function() self.on_clipboard(text) end)
+      vim.notify('[suffuse] watch envelope error: ' .. err, vim.log.levels.WARN)
+    elseif msg then
+      if msg.items then
+        local text = proto.text_from_items(msg.items)
+        if text then
+          if self.on_clipboard then
+            vim.schedule(function() self.on_clipboard(text) end)
+          end
+        else
+          vim.notify('[suffuse] watch: msg had items but no text/plain. items=' .. vim.inspect(msg.items), vim.log.levels.WARN)
+        end
+      else
+        vim.notify('[suffuse] watch: msg has no items: ' .. vim.inspect(msg), vim.log.levels.WARN)
       end
     end
   end
