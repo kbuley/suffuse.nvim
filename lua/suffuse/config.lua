@@ -17,6 +17,14 @@ M.defaults = {
   token        = '',     -- empty = no auth (still TLS-encrypted with default passphrase)
   auto_connect = true,   -- connect on VimEnter
 
+  -- Clipboard provider registration mode.
+  -- 'auto'   detect in order: daemon → binary → plugin (default)
+  -- 'daemon' direct Lua HTTP to local suffuse daemon only
+  -- 'binary' shell out to suffuse binary only
+  -- 'plugin' direct TLS/HTTP from plugin only
+  -- 'off'    do not register vim.g.clipboard
+  clipboard_mode = 'auto',
+
   yank = {
     enable   = true,
     -- '"'      unnamed register — all yanks/deletes (default)

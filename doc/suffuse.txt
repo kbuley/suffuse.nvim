@@ -114,6 +114,22 @@ Any combination of valid register names. Default `{ '+', '*' }` writes to
 both system clipboard registers. On macOS these are aliased so setting both
 is harmless.
 
+CLIPBOARD_MODE~
+
+  `'auto'`    Detect best available tier in order: daemon → binary → plugin.
+              (default)
+  `'daemon'`  Direct Lua HTTP to local suffuse daemon on localhost only.
+              Best when suffuse is running as a sidecar in the same container.
+  `'binary'`  Shell out to `suffuse copy` / `suffuse paste` on PATH.
+              Use when the binary is available but the daemon is remote.
+  `'plugin'`  Direct TLS/HTTP from the plugin. No binary or daemon required.
+  `'off'`     Do not register vim.g.clipboard. Manage registers manually.
+
+When any mode other than 'off' is active, suffuse registers itself as
+vim.g.clipboard so that Neovim's built-in `unnamedplus` clipboard just works
+without requiring :SuffusePaste. The watch stream still pushes remote updates
+into the paste registers automatically.
+
 TOKEN / AUTHENTICATION~
 
 The `token` maps directly to the `--token` flag on the suffuse server. When
@@ -146,26 +162,23 @@ explicitly to skip probing entirely.
   Press q or <Esc> to close.
 
 :SuffuseCopy [register]                                  *:SuffuseCopy*
-  Send the contents of [register] to the suffuse clipboard. If register is
-  omitted, uses `yank.register` from config. If `yank.register` is 'prompt',
-  opens a vim.ui.select() picker.
+  Manually send the contents of [register] to the suffuse clipboard.
+  Not normally needed when clipboard_mode is active — yanking handles
+  this automatically.
 
 :SuffusePaste                                            *:SuffusePaste*
-  Pull the latest clipboard from the server, write it to all configured
-  `paste.registers`, and insert it at the cursor position.
+  Manually pull the latest clipboard from the server and insert at cursor.
+  Not normally needed — the watch stream keeps paste registers current.
 
 ==============================================================================
 6. KEYMAPS                                                *suffuse-keymaps*
 
-suffuse.nvim sets no keymaps by default. Example: >lua
+suffuse.nvim sets no keymaps. When vim.g.clipboard is registered (any
+clipboard_mode other than 'off'), normal yank/paste operations work
+automatically via Neovim's built-in unnamedplus clipboard support. No
+keymaps are needed.
 
-  vim.keymap.set({ 'n', 'v' }, '<leader>sc',
-    '<cmd>SuffuseCopy<cr>',
-    { desc = 'suffuse: copy to shared clipboard' })
-
-  vim.keymap.set('n', '<leader>sp',
-    '<cmd>SuffusePaste<cr>',
-    { desc = 'suffuse: paste from shared clipboard' })
+If you want a quick shortcut to the status window: >lua
 
   vim.keymap.set('n', '<leader>ss',
     '<cmd>SuffuseStatus<cr>',

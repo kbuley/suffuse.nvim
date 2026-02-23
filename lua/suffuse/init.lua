@@ -23,6 +23,12 @@ function M.setup(user_opts)
     M._apply_paste(text)
   end)
 
+  -- Register vim.g.clipboard so plain Neovim unnamedplus works without the plugin
+  local tier = require('suffuse.clipboard').register(_cfg, function() return _client end)
+  if tier ~= 'off' then
+    vim.notify(string.format('[suffuse] clipboard provider: %s', tier), vim.log.levels.DEBUG)
+  end
+
   _augroup = vim.api.nvim_create_augroup('Suffuse', { clear = true })
   M._setup_autocmds()
   M._setup_commands()
