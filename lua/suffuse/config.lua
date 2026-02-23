@@ -18,10 +18,14 @@ M.defaults = {
   token        = '',     -- empty = no auth (still TLS-encrypted with default passphrase)
   auto_connect = true,   -- connect on VimEnter
 
+  -- Path to the suffuse binary. nil = find on PATH.
+  -- Used by 'daemon' and 'binary' clipboard modes.
+  bin = nil,
+
   -- Clipboard provider registration mode.
   -- 'auto'   detect in order: daemon → binary → plugin (default)
-  -- 'daemon' direct Lua HTTP to local suffuse daemon only
-  -- 'binary' shell out to suffuse binary only
+  -- 'daemon' shell out to local suffuse daemon via IPC socket
+  -- 'binary' shell out to suffuse binary with explicit host/port
   -- 'plugin' direct TLS/HTTP from plugin only
   -- 'off'    do not register vim.g.clipboard
   clipboard_mode = 'auto',
@@ -41,7 +45,8 @@ M.defaults = {
 }
 
 ---@param user table|nil
----@return table
+---@return table  resolved config (defaults + user overrides)
+---@return table  explicit config (only keys the user actually provided)
 function M.resolve(user)
   user = user or {}
   local cfg = vim.deepcopy(M.defaults)
@@ -52,7 +57,10 @@ function M.resolve(user)
       cfg[k] = v
     end
   end
-  return cfg
+  -- explicit tracks only what the user set; used by binary mode to avoid
+  -- overwriting options that the binary would pick up from its own config file.
+  local explicit = vim.deepcopy(user)
+  return cfg, explicit
 end
 
 return M

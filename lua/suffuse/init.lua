@@ -17,7 +17,8 @@ function M.setup(user_opts)
     _client = nil
   end
 
-  _cfg    = require('suffuse.config').resolve(user_opts)
+  local explicit
+  _cfg, explicit = require('suffuse.config').resolve(user_opts)
   _client = require('suffuse.client').new(_cfg)
 
   _client:on_clipboard_update(function(text)
@@ -25,7 +26,7 @@ function M.setup(user_opts)
   end)
 
   -- Register vim.g.clipboard so plain Neovim unnamedplus works without the plugin
-  local tier = require('suffuse.clipboard').register(_cfg, function() return _client end)
+  local tier = require('suffuse.clipboard').register(_cfg, explicit, function() return _client end)
   if tier ~= 'off' then
     vim.notify(string.format('[suffuse] clipboard provider: %s', tier), vim.log.levels.DEBUG)
   end

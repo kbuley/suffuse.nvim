@@ -2,163 +2,135 @@
 -- Detects which clipboard tier is available and registers vim.g.clipboard.
 --
 -- Tiers (in auto-detect order):
---   daemon  — suffuse daemon running locally (IPC socket present);
---             copy/paste via `suffuse copy` / `suffuse paste` which use the
---             Unix socket automatically. Synchronous via vim.system.
---   binary  — `suffuse` binary on PATH but no local daemon;
---             shell out with explicit --upstream host:port flags.
---   plugin  — direct TLS/HTTP from this plugin (in-progress).
---   off     — do not touch vim.g.clipboard.
+--   daemon  — suffuse IPC socket present; binary uses it automatically, no flags needed
+--   binary  — `suffuse` on PATH, no local daemon; probe host order in the binary
+--   plugin  — direct TLS/HTTP from this plugin (in-progress)
+--   off     — do not touch vim.g.clipboard
 
 local M = {}
 
 -- ── Tier detection ────────────────────────────────────────────────────────────
 
---- Check if the suffuse daemon is running by probing the IPC socket.
---- Mirrors ipc.IsRunning() from the Go package.
----@return boolean
 local function daemon_running()
   local path = os.getenv('SUFFUSE_SOCKET')
   if not path or path == '' then
     path = (os.getenv('TMPDIR') or '/tmp') .. '/suffuse.sock'
   end
   if vim.fn.filereadable(path) == 0 then return false end
-  local ok   = false
-  local done = false
+  local ok, done = false, false
   local pipe = vim.uv.new_pipe(false)
   pipe:connect(path, function(err)
-    ok   = not err
-    done = true
+    ok, done = not err, true
     pcall(function() pipe:close() end)
   end)
   local deadline = vim.uv.now() + 200
-  while not done and vim.uv.now() < deadline do
-    vim.uv.run('nowait')
-  end
+  while not done and vim.uv.now() < deadline do vim.uv.run('nowait') end
   if not done then pcall(function() pipe:close() end) end
   return ok
 end
 
---- Check if the suffuse binary exists on PATH.
----@return string|nil  full path or nil
-local function binary_path()
-  local path = vim.fn.exepath('suffuse')
-  return path ~= '' and path or nil
+local function binary_path(cfg)
+  if cfg and cfg.bin and cfg.bin ~= '' then
+    return cfg.bin
+  end
+  local p = vim.fn.exepath('suffuse')
+  return p ~= '' and p or nil
 end
 
---- Resolve which tier to use given the config.
----@param cfg table
----@return string  'daemon'|'binary'|'plugin'|'off'
 function M.detect(cfg)
   local mode = cfg.clipboard_mode or 'auto'
-  if mode == 'off' then return 'off' end
-
-  if mode == 'daemon' then
-    return daemon_running() and 'daemon' or 'off'
-  end
-
-  if mode == 'binary' then
-    return binary_path() and 'binary' or 'off'
-  end
-
-  if mode == 'plugin' then
-    return 'plugin'
-  end
-
-  -- auto: local daemon (IPC) → binary → plugin
-  if daemon_running() then return 'daemon' end
-  if binary_path()    then return 'binary' end
+  if mode == 'off'    then return 'off' end
+  if mode == 'daemon' then return daemon_running() and 'daemon' or 'off' end
+  if mode == 'binary' then return binary_path(cfg) and 'binary' or 'off' end
+  if mode == 'plugin' then return 'plugin' end
+  -- auto
+  if daemon_running()    then return 'daemon' end
+  if binary_path(cfg)    then return 'binary' end
   return 'plugin'
 end
 
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 
---- Run `suffuse paste` synchronously and return lines, regtype.
----@param bin string
----@return string[], string
-local function run_paste(bin)
-  local result = vim.system({ bin, 'paste' }, { text = true }):wait()
+-- Build argv for `suffuse copy|paste`.
+-- explicit contains only the keys the user explicitly set in their plugin config.
+-- Only those keys are forwarded as CLI flags; everything else the binary resolves
+-- itself from its own config file, env vars, and built-in defaults.
+local function build_args(bin, sub, cfg, explicit)
+  local args = { bin, sub }
+  explicit = explicit or {}
+  if explicit.host then
+    args[#args+1] = '--host=' .. cfg.host
+  end
+  if explicit.port then
+    args[#args+1] = '--port=' .. cfg.port
+  end
+  if explicit.token then
+    args[#args+1] = '--token=' .. (cfg.token or '')
+  end
+  return args
+end
+
+local function run_paste_cmd(bin, cfg, explicit)
+  if not vim.system then return { '' }, 'c' end
+  local result = vim.system(build_args(bin, 'paste', cfg, explicit), { text = true }):wait()
   if result.code ~= 0 or not result.stdout or result.stdout == '' then
     return { '' }, 'c'
   end
-  local text = result.stdout:gsub('\n$', '')
+  local text = result.stdout
+  if text:sub(-1) == '\n' then text = text:sub(1, -2) end
   return vim.split(text, '\n', { plain = true }), 'V'
+end
+
+local function run_copy_cmd(bin, cfg, explicit, lines)
+  if not vim.system then return end
+  vim.system(build_args(bin, 'copy', cfg, explicit), { stdin = table.concat(lines, '\n') })
 end
 
 -- ── Provider builders ─────────────────────────────────────────────────────────
 
---- Build a g:clipboard table that uses the local IPC daemon via the binary.
---- No host/port needed — the binary finds the socket itself.
----@param get_client fun(): table|nil
----@return table
-local function daemon_provider(get_client)
-  local bin = binary_path()
+-- Daemon tier: IPC socket is live; binary finds it automatically.
+-- No CLI args forwarded — the binary uses the IPC socket unconditionally.
+local function daemon_provider(cfg, get_client)
+  local bin = binary_path(cfg)
 
   if bin and vim.system then
     return {
-      name          = 'suffuse-daemon',
+      name  = 'suffuse-daemon',
       copy  = {
-        ['+'] = function(lines, _) vim.system({ bin, 'copy' }, { stdin = table.concat(lines, '\n') }) end,
-        ['*'] = function(lines, _) vim.system({ bin, 'copy' }, { stdin = table.concat(lines, '\n') }) end,
+        ['+'] = function(lines, _) run_copy_cmd(bin, cfg, {}, lines) end,
+        ['*'] = function(lines, _) run_copy_cmd(bin, cfg, {}, lines) end,
       },
       paste = {
-        ['+'] = function() return run_paste(bin) end,
-        ['*'] = function() return run_paste(bin) end,
+        ['+'] = function() return run_paste_cmd(bin, cfg, {}) end,
+        ['*'] = function() return run_paste_cmd(bin, cfg, {}) end,
       },
       cache_enabled = 0,
     }
   end
 
-  -- No binary or Neovim < 0.10: fall through to plugin provider
-  return require('suffuse.clipboard')._plugin_provider(get_client)
+  return M._plugin_provider(get_client)
 end
 
---- Build a g:clipboard table that shells out to the suffuse binary with
---- explicit upstream flags (no local daemon).
----@param cfg table
----@return table
-local function binary_provider(cfg)
-  local bin   = binary_path() or 'suffuse'
-  local flags = {}
-  if cfg.host and cfg.host ~= '' then
-    table.insert(flags, '--upstream=' .. cfg.host .. ':' .. cfg.port)
-  end
-  if cfg.token and cfg.token ~= '' then
-    table.insert(flags, '--token=' .. cfg.token)
-  end
-
-  local function copy_cmd(lines)
-    local args = { bin, 'copy' }
-    for _, f in ipairs(flags) do table.insert(args, f) end
-    vim.system(args, { stdin = table.concat(lines, '\n') })
-  end
-
-  local function paste_cmd()
-    local args = { bin, 'paste' }
-    for _, f in ipairs(flags) do table.insert(args, f) end
-    if not vim.system then return { '' }, 'c' end
-    local result = vim.system(args, { text = true }):wait()
-    if result.code ~= 0 or not result.stdout or result.stdout == '' then
-      return { '' }, 'c'
-    end
-    local text = result.stdout:gsub('\n$', '')
-    return vim.split(text, '\n', { plain = true }), 'V'
-  end
+-- Binary tier: no local daemon. Only explicitly-configured plugin options are
+-- forwarded as CLI flags; everything else the binary resolves itself.
+local function binary_provider(cfg, explicit)
+  local bin = binary_path(cfg) or 'suffuse'
 
   return {
-    name          = 'suffuse-binary',
-    copy          = { ['+'] = function(lines, _) copy_cmd(lines) end,
-                      ['*'] = function(lines, _) copy_cmd(lines) end },
-    paste         = { ['+'] = paste_cmd, ['*'] = paste_cmd },
+    name  = 'suffuse-binary',
+    copy  = {
+      ['+'] = function(lines, _) run_copy_cmd(bin, cfg, explicit, lines) end,
+      ['*'] = function(lines, _) run_copy_cmd(bin, cfg, explicit, lines) end,
+    },
+    paste = {
+      ['+'] = function() return run_paste_cmd(bin, cfg, explicit) end,
+      ['*'] = function() return run_paste_cmd(bin, cfg, explicit) end,
+    },
     cache_enabled = 0,
   }
 end
 
---- Build a g:clipboard table backed by the Lua client.
---- Copy calls client:send_text(); paste reads whatever the watch stream
---- last deposited in '+'. Exposed as M._plugin_provider for fallback use.
----@param get_client fun(): table|nil
----@return table
+-- Plugin tier: pure Lua via the watch-stream client.
 local function plugin_provider(get_client)
   local _sending = false
 
@@ -181,34 +153,35 @@ local function plugin_provider(get_client)
   end
 
   return {
-    name          = 'suffuse-plugin',
-    copy          = { ['+'] = copy_fn, ['*'] = copy_fn },
-    paste         = { ['+'] = paste_fn, ['*'] = paste_fn },
+    name  = 'suffuse-plugin',
+    copy  = { ['+'] = copy_fn, ['*'] = copy_fn },
+    paste = { ['+'] = paste_fn, ['*'] = paste_fn },
     cache_enabled = 0,
   }
 end
 
--- Expose for fallback use from daemon_provider
 M._plugin_provider = plugin_provider
 
 -- ── Public API ────────────────────────────────────────────────────────────────
 
---- Detect the best available tier and register vim.g.clipboard.
----@param cfg        table
----@param get_client fun(): table|nil
----@return string  the tier that was selected
-function M.register(cfg, get_client)
+function M.register(cfg, explicit, get_client)
   if cfg.clipboard_mode == 'off' then return 'off' end
 
   local tier = M.detect(cfg)
-
   local provider
+
   if tier == 'daemon' then
-    provider = daemon_provider(get_client)
+    -- Daemon: binary uses IPC socket, no CLI args needed
+    provider = daemon_provider(cfg, get_client)
+
   elseif tier == 'binary' then
-    provider = binary_provider(cfg)
+    -- Binary: only forward flags the user explicitly set in plugin config
+    provider = binary_provider(cfg, explicit)
+
   elseif tier == 'plugin' then
+    -- Plugin: pure Lua, uses cfg directly (including defaults for host probing)
     provider = plugin_provider(get_client)
+
   else
     return 'off'
   end
