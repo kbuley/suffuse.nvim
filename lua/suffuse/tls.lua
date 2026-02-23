@@ -101,13 +101,25 @@ end
 -- Drain ciphertext from net_bio and send via tcp
 local function flush_net_bio(ssl_conn)
   local pending = libssl.BIO_ctrl(ssl_conn.net_bio, BIO_CTRL_PENDING, 0, nil)
+  local total = 0
   while pending > 0 do
     local buf = ffi.new('char[?]', pending)
     local n   = libssl.BIO_read(ssl_conn.net_bio, buf, pending)
     if n <= 0 then break end
-    ssl_conn.tcp:write(ffi.string(buf, n))
+    local bytes = ffi.string(buf, n)
+    total = total + n
+    ssl_conn.tcp:write(bytes, function(err)
+      if err then
+        vim.schedule(function()
+          vim.notify('[suffuse] flush_net_bio write err: ' .. tostring(err), vim.log.levels.WARN)
+        end)
+      end
+    end)
     pending = libssl.BIO_ctrl(ssl_conn.net_bio, BIO_CTRL_PENDING, 0, nil)
   end
+  vim.schedule(function()
+    vim.notify(string.format('[suffuse] flush_net_bio sent %d bytes', total), vim.log.levels.WARN)
+  end)
 end
 
 -- ── TlsConn ───────────────────────────────────────────────────────────────────
