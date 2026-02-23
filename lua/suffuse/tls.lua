@@ -122,6 +122,7 @@ TlsConn.__index = TlsConn
 ---@param host     string
 ---@param on_ready fun(conn: table|nil, err: string|nil)
 function M.wrap(tcp, host, on_ready)
+  vim.notify('[suffuse] tls.wrap called host=' .. tostring(host), vim.log.levels.WARN)
   local ctx = get_ctx()
   local ssl = libssl.SSL_new(ctx)
   if ssl == nil then

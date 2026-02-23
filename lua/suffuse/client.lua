@@ -51,12 +51,16 @@ local function connect(host, port, cb)
 
       -- Async TLS handshake via memory BIOs + tcp:read_start
       tls.wrap(tcp, host, function(conn, herr)
-        if not conn then
-          tcp:close()
-          vim.schedule(function() cb(nil, herr) end)
-          return
-        end
-        vim.schedule(function() cb(conn, nil) end)
+        vim.schedule(function()
+          if not conn then
+            tcp:close()
+            vim.notify('[suffuse] tls.wrap failed: ' .. tostring(herr), vim.log.levels.WARN)
+            cb(nil, herr)
+          else
+            vim.notify('[suffuse] tls.wrap ok', vim.log.levels.WARN)
+            cb(conn, nil)
+          end
+        end)
       end)
     end)
   end)
