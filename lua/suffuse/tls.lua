@@ -56,11 +56,16 @@ local M = { available = true }
 local SSL_VERIFY_NONE = 0
 
 local function ssl_err_string()
-  local code = libssl.ERR_get_error()
-  if code == 0 then return 'unknown SSL error' end
-  local buf = ffi.new('char[256]')
-  libssl.ERR_error_string_n(code, buf, 256)
-  return ffi.string(buf)
+  local msgs = {}
+  while true do
+    local code = libssl.ERR_get_error()
+    if code == 0 then break end
+    local buf = ffi.new('char[256]')
+    libssl.ERR_error_string_n(code, buf, 256)
+    table.insert(msgs, ffi.string(buf))
+  end
+  if #msgs == 0 then return 'unknown SSL error (empty queue)' end
+  return table.concat(msgs, '; ')
 end
 
 local _ctx
@@ -107,9 +112,10 @@ function M.wrap(tcp, host)
 
   local ret = libssl.SSL_connect(ssl)
   if ret ~= 1 then
-    local errmsg = ssl_err_string()
+    local ssl_err = libssl.SSL_get_error(ssl, ret)
+    local errmsg  = ssl_err_string()
     libssl.SSL_free(ssl)
-    return nil, 'SSL_connect failed: ' .. errmsg
+    return nil, string.format('SSL_connect failed: ret=%d ssl_err=%d %s', ret, ssl_err, errmsg)
   end
 
   return setmetatable({ ssl = ssl, tcp = tcp }, TlsConn), nil
