@@ -1,12 +1,9 @@
 -- lua/suffuse/client.lua
 -- HTTP/1.1 + TLS transport for the suffuse grpc-gateway.
 --
--- Two connections are maintained:
---   watch_conn  — persistent GET /v1/watch, chunked streaming response
---   (rpc)       — short-lived connections for POST /v1/copy, GET /v1/status
---
--- Hostnames are resolved via vim.uv.getaddrinfo() before each TCP connect
--- since vim.uv TCP handles require a resolved IP address.
+-- Two connection types:
+--   watch_conn  — persistent, uses conn:read_start() for streaming
+--   rpc         — short-lived, uses conn:read_sync() for copy/paste/status
 
 local proto = require('suffuse.protocol')
 local tls   = require('suffuse.tls')
@@ -24,8 +21,6 @@ local BACKOFF_MAX  = 30000
 
 -- ── DNS + TCP + TLS connect ───────────────────────────────────────────────────
 
---- Resolve hostname to IP, open TCP connection, perform TLS handshake.
---- Calls cb(conn, errmsg) on completion. conn is a TlsConn on success.
 ---@param host string
 ---@param port integer
 ---@param cb   fun(conn: table|nil, err: string|nil)
@@ -35,79 +30,58 @@ local function connect(host, port, cb)
     return
   end
 
-  -- Resolve hostname → IP (required; vim.uv.tcp:connect() needs a numeric IP)
   vim.uv.getaddrinfo(host, tostring(port), { socktype = 'stream' }, function(err, res)
     if err or not res or not res[1] then
       vim.schedule(function()
-        cb(nil, 'DNS resolution failed for ' .. host .. ': ' .. tostring(err))
+        cb(nil, 'DNS failed for ' .. host .. ': ' .. tostring(err))
       end)
       return
     end
 
-    local ip = res[1].addr
-
+    local ip  = res[1].addr
     local tcp = vim.uv.new_tcp()
     tcp:connect(ip, port, function(cerr)
       if cerr then
         tcp:close()
         vim.schedule(function()
-          cb(nil, 'TCP connect failed (' .. host .. '): ' .. cerr)
+          cb(nil, 'TCP connect (' .. host .. '): ' .. cerr)
         end)
         return
       end
 
-      -- TLS handshake on main loop (brief block during connection setup only)
-      vim.schedule(function()
-        local conn, herr = tls.wrap(tcp, host)
+      -- Async TLS handshake via memory BIOs + tcp:read_start
+      tls.wrap(tcp, host, function(conn, herr)
         if not conn then
           tcp:close()
-          cb(nil, herr)
+          vim.schedule(function() cb(nil, herr) end)
           return
         end
-        cb(conn, nil)
+        vim.schedule(function() cb(conn, nil) end)
       end)
     end)
   end)
 end
 
---- Probe a host by attempting a TCP connection (no TLS, just reachability).
---- Calls cb(ip) on success, cb(nil) on failure.
 ---@param host string
 ---@param port integer
----@param cb   fun(ip: string|nil)
+---@param cb   fun(reachable: boolean)
 local function probe(host, port, cb)
   vim.uv.getaddrinfo(host, tostring(port), { socktype = 'stream' }, function(err, res)
-    if err or not res or not res[1] then cb(nil); return end
-    local ip  = res[1].addr
+    if err or not res or not res[1] then cb(false); return end
     local tcp = vim.uv.new_tcp()
-    tcp:connect(ip, port, function(cerr)
+    tcp:connect(res[1].addr, port, function(cerr)
       tcp:close()
-      cb(cerr and nil or ip)
+      cb(not cerr)
     end)
   end)
 end
 
 -- ── Client ────────────────────────────────────────────────────────────────────
 
----@class SuffuseClient
----@field cfg             table
----@field state           string
----@field resolved_host   string|nil
----@field watch_conn      table|nil
----@field backoff         integer
----@field reconnect_timer uv_timer_t|nil
----@field on_clipboard    fun(text:string)|nil
----@field _watch_buf      string
----@field _watch_body_buf string
----@field _watch_headers  boolean
----@field source          string
 local Client = {}
 Client.__index = Client
 
----@param cfg table
----@return SuffuseClient
 function M.new(cfg)
-  local source = vim.fn.hostname()
   return setmetatable({
     cfg              = cfg,
     state            = STATE.DISCONNECTED,
@@ -119,13 +93,12 @@ function M.new(cfg)
     _watch_buf       = '',
     _watch_body_buf  = '',
     _watch_headers   = false,
-    source           = source ~= '' and source or 'nvim',
+    source           = vim.fn.hostname() or 'nvim',
   }, Client)
 end
 
 function Client:get_state() return self.state         end
 function Client:get_host()  return self.resolved_host end
-
 function Client:on_clipboard_update(fn) self.on_clipboard = fn end
 
 -- ── Public API ────────────────────────────────────────────────────────────────
@@ -144,7 +117,6 @@ function Client:disconnect()
   self.backoff       = BACKOFF_INIT
 end
 
----@param text string
 function Client:send_text(text)
   if self.state ~= STATE.CONNECTED then
     vim.notify('[suffuse] not connected', vim.log.levels.WARN)
@@ -157,50 +129,43 @@ function Client:send_text(text)
       vim.notify('[suffuse] copy: ' .. err, vim.log.levels.WARN)
       return
     end
-    local ok, werr = conn:write(req)
-    if not ok then
-      vim.notify('[suffuse] copy write: ' .. (werr or '?'), vim.log.levels.WARN)
-    end
-    conn:read(4096)  -- discard response
+    conn:write(req)
+    conn:read_sync(4096)  -- discard response
     conn:close()
   end)
 end
 
----@param cb fun(text: string|nil, err: string|nil)
 function Client:fetch_paste(cb)
   if self.state ~= STATE.CONNECTED then cb(nil, 'not connected'); return end
   local host = self.resolved_host
   local req  = proto.paste_request(host, self.cfg.token)
   connect(host, self.cfg.port, function(conn, err)
     if err then cb(nil, err); return end
-    local ok, werr = conn:write(req)
-    if not ok then conn:close(); cb(nil, werr); return end
-    local raw, rerr = conn:read(65536)
+    conn:write(req)
+    local raw, rerr = conn:read_sync(65536)
     conn:close()
     if not raw then cb(nil, rerr); return end
     local _, _, body = proto.parse_headers(raw)
-    local ok2, obj  = pcall(vim.json.decode, body)
-    if not ok2 then cb(nil, 'json: ' .. tostring(obj)); return end
+    local ok, obj    = pcall(vim.json.decode, body)
+    if not ok then cb(nil, 'json: ' .. tostring(obj)); return end
     local text = proto.text_from_items(obj.items)
     cb(text, text and nil or 'no text/plain in response')
   end)
 end
 
----@param cb fun(msg: table|nil, err: string|nil)
 function Client:fetch_status(cb)
   if self.state ~= STATE.CONNECTED then cb(nil, 'not connected'); return end
   local host = self.resolved_host
   local req  = proto.status_request(host, self.cfg.token)
   connect(host, self.cfg.port, function(conn, err)
     if err then cb(nil, err); return end
-    local ok, werr = conn:write(req)
-    if not ok then conn:close(); cb(nil, werr); return end
-    local raw, rerr = conn:read(65536)
+    conn:write(req)
+    local raw, rerr = conn:read_sync(65536)
     conn:close()
     if not raw then cb(nil, rerr); return end
     local _, _, body = proto.parse_headers(raw)
-    local ok2, obj  = pcall(vim.json.decode, body)
-    if not ok2 then cb(nil, 'json: ' .. tostring(obj)); return end
+    local ok, obj    = pcall(vim.json.decode, body)
+    if not ok then cb(nil, 'json: ' .. tostring(obj)); return end
     cb(obj, nil)
   end)
 end
@@ -237,8 +202,8 @@ function Client:_probe()
       return
     end
     local host = hosts[idx]
-    probe(host, self.cfg.port, function(ip)
-      if not ip then try_next(); return end
+    probe(host, self.cfg.port, function(ok)
+      if not ok then try_next(); return end
       self.resolved_host = host
       vim.schedule(function() self:_open_watch(host) end)
     end)
@@ -247,7 +212,6 @@ function Client:_probe()
   try_next()
 end
 
----@param host string
 function Client:_open_watch(host)
   self.state = STATE.CONNECTING
   connect(host, self.cfg.port, function(conn, err)
@@ -258,11 +222,11 @@ function Client:_open_watch(host)
       return
     end
 
-    local req = proto.watch_request(host, self.cfg.token)
+    local req    = proto.watch_request(host, self.cfg.token)
     local ok, werr = conn:write(req)
     if not ok then
       conn:close()
-      vim.notify('[suffuse] watch write failed: ' .. (werr or '?'), vim.log.levels.WARN)
+      vim.notify('[suffuse] watch write: ' .. (werr or '?'), vim.log.levels.WARN)
       self.state = STATE.DISCONNECTED
       self:_schedule_reconnect(function() self:_start() end)
       return
@@ -278,52 +242,21 @@ function Client:_open_watch(host)
     vim.notify(string.format('[suffuse] connected to %s:%d', host, self.cfg.port),
       vim.log.levels.INFO)
 
-    self:_start_watch_read(conn)
+    conn:read_start(
+      function(data) self:_on_watch_data(data) end,
+      function(e)    self:_watch_disconnected(e) end
+    )
   end)
 end
 
----@param conn table  TlsConn
-function Client:_start_watch_read(conn)
-  local fd = conn:fd()
-  if not fd or fd < 0 then
-    self:_watch_disconnected('could not get watch fd')
-    return
-  end
-
-  local poll = vim.uv.new_poll(fd)
-  poll:start('r', function(err, events)
-    if err or not events then
-      poll:stop(); poll:close()
-      self:_watch_disconnected(err or 'poll error')
-      return
-    end
-
-    local chunk, rerr, retry = conn:read(16384)
-    if retry then return end  -- WANT_READ: no data yet, wait for next poll event
-    if not chunk then
-      poll:stop(); poll:close()
-      self:_watch_disconnected(rerr or 'read error')
-      return
-    end
-
-    self:_on_watch_data(chunk)
-  end)
-end
-
----@param data string
 function Client:_on_watch_data(data)
-  vim.notify(string.format('[suffuse] watch data: headers=%s len=%d', tostring(self._watch_headers), #data), vim.log.levels.WARN)
   if not self._watch_headers then
     self._watch_buf = self._watch_buf .. data
     local status, _, rest = proto.parse_headers(self._watch_buf)
-    if not status then
-      vim.notify('[suffuse] watch: headers incomplete, buffering', vim.log.levels.WARN)
-      return
-    end
+    if not status then return end
 
     self._watch_headers = true
     self._watch_buf     = ''
-    vim.notify(string.format('[suffuse] watch: HTTP %d rest_len=%d', status, #rest), vim.log.levels.WARN)
 
     if status ~= 200 then
       vim.notify(string.format('[suffuse] watch HTTP %d', status), vim.log.levels.WARN)
@@ -337,7 +270,6 @@ function Client:_on_watch_data(data)
     self:_process_watch_body()
   else
     self._watch_body_buf = self._watch_body_buf .. data
-    vim.notify(string.format('[suffuse] watch body buf len=%d', #self._watch_body_buf), vim.log.levels.WARN)
     self:_process_watch_body()
   end
 end
@@ -349,19 +281,11 @@ function Client:_process_watch_body()
   for _, line in ipairs(lines) do
     local msg, err = proto.unwrap_watch(line)
     if err then
-      vim.notify('[suffuse] watch envelope error: ' .. err, vim.log.levels.WARN)
-    elseif msg then
-      if msg.items then
-        local text = proto.text_from_items(msg.items)
-        if text then
-          if self.on_clipboard then
-            vim.schedule(function() self.on_clipboard(text) end)
-          end
-        else
-          vim.notify('[suffuse] watch: msg had items but no text/plain. items=' .. vim.inspect(msg.items), vim.log.levels.WARN)
-        end
-      else
-        vim.notify('[suffuse] watch: msg has no items: ' .. vim.inspect(msg), vim.log.levels.WARN)
+      vim.notify('[suffuse] watch: ' .. err, vim.log.levels.DEBUG)
+    elseif msg and msg.items then
+      local text = proto.text_from_items(msg.items)
+      if text and self.on_clipboard then
+        vim.schedule(function() self.on_clipboard(text) end)
       end
     end
   end

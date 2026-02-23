@@ -1,17 +1,21 @@
 -- lua/suffuse/tls.lua
--- TLS via LuaJIT FFI → OpenSSL.
+-- TLS via LuaJIT FFI → OpenSSL using memory BIOs.
 --
--- Wraps a connected vim.uv TCP handle with SSL. The rest of the client sees
--- the same read/write interface regardless of TLS.
+-- Uses BIO pairs to decouple OpenSSL from the file descriptor entirely:
+--   app_bio  ← we read plaintext from here after SSL_read
+--   net_bio  ← we feed ciphertext into here from libuv, and drain it to send
 --
--- The server uses a self-signed certificate derived from the shared token.
--- We skip certificate chain verification (SSL_CTX_set_verify NONE) because
--- we cannot reproduce the HKDF key derivation in Lua. Traffic is still
--- encrypted; the token in the Authorization header provides authentication.
+-- This means all I/O goes through libuv's tcp:read_start() / tcp:write(),
+-- which is the correct way to integrate with libuv's event loop.
+-- We never touch the fd directly, so there's no conflict with libuv.
 --
--- libuv sets all TCP sockets to non-blocking mode. SSL_connect() requires the
--- fd to be blocking (or a poll loop). We temporarily set the fd to blocking
--- for the handshake via fcntl(F_SETFL), then restore it afterward.
+-- The TLS handshake runs asynchronously:
+--   1. ssl:connect() is called; it generates ClientHello into net_bio
+--   2. We drain net_bio → send via tcp:write()
+--   3. libuv calls read_start callback with ServerHello data
+--   4. We feed data into net_bio, call ssl:connect() again (loop)
+--   5. Once ssl:connect() returns 1 the handshake is complete
+--   6. We switch into data mode: ssl:write() / ssl:read() + drain/feed loop
 
 if not jit then
   return { available = false }
@@ -19,50 +23,36 @@ end
 
 local ffi = require('ffi')
 
--- ── libc (fcntl) ─────────────────────────────────────────────────────────────
-
 ffi.cdef[[
-  int fcntl(int fd, int cmd, ...);
-]]
+  /* BIO */
+  typedef struct bio_st BIO;
+  typedef struct bio_method_st BIO_METHOD;
+  const BIO_METHOD *BIO_s_mem(void);
+  BIO  *BIO_new(const BIO_METHOD *type);
+  int   BIO_new_bio_pair(BIO **bio1, size_t writebuf1, BIO **bio2, size_t writebuf2);
+  int   BIO_read(BIO *b, void *data, int len);
+  int   BIO_write(BIO *b, const void *data, int len);
+  int   BIO_ctrl(BIO *bp, int cmd, long larg, void *parg);
+  void  BIO_free(BIO *a);
+  void  BIO_free_all(BIO *a);
 
--- ffi.C gives access to symbols already in the process (libc is always loaded)
-local F_GETFL = 3
-local F_SETFL = 4
-local O_NONBLOCK = 2048  -- 0x800 on Linux/aarch64 and x86_64
-
-local function set_blocking(fd, blocking)
-  local flags = ffi.C.fcntl(fd, F_GETFL, 0)
-  if flags < 0 then return end
-  if blocking then
-    flags = bit.band(flags, bit.bnot(O_NONBLOCK))
-  else
-    flags = bit.bor(flags, O_NONBLOCK)
-  end
-  ffi.C.fcntl(fd, F_SETFL, ffi.cast('int', flags))
-end
-
--- ── OpenSSL FFI declarations ─────────────────────────────────────────────────
-
-ffi.cdef[[
+  /* SSL */
   int      OPENSSL_init_ssl(uint64_t opts, const void *settings);
-
   typedef struct ssl_ctx_st SSL_CTX;
   SSL_CTX *SSL_CTX_new(const void *method);
   void     SSL_CTX_free(SSL_CTX *ctx);
   void     SSL_CTX_set_verify(SSL_CTX *ctx, int mode, void *cb);
-
   typedef struct ssl_st SSL;
   SSL     *SSL_new(SSL_CTX *ctx);
   void     SSL_free(SSL *ssl);
-  int      SSL_set_fd(SSL *ssl, int fd);
-  int      SSL_connect(SSL *ssl);
+  void     SSL_set_bio(SSL *ssl, BIO *rbio, BIO *wbio);
+  void     SSL_set_connect_state(SSL *ssl);
+  int      SSL_do_handshake(SSL *ssl);
   int      SSL_read(SSL *ssl, void *buf, int num);
   int      SSL_write(SSL *ssl, const void *buf, int num);
   int      SSL_get_error(SSL *ssl, int ret);
   long     SSL_ctrl(SSL *ssl, int cmd, long larg, void *parg);
-
   const void *TLS_client_method(void);
-
   unsigned long ERR_get_error(void);
   void          ERR_error_string_n(unsigned long e, char *buf, size_t len);
 ]]
@@ -79,7 +69,11 @@ end
 
 local M = { available = true }
 
+local SSL_ERROR_WANT_READ  = 2
+local SSL_ERROR_WANT_WRITE = 3
+local SSL_ERROR_ZERO_RETURN = 6
 local SSL_VERIFY_NONE = 0
+local BIO_CTRL_PENDING = 10  -- BIO_pending()
 
 local function ssl_err_string()
   local msgs = {}
@@ -90,8 +84,7 @@ local function ssl_err_string()
     libssl.ERR_error_string_n(code, buf, 256)
     table.insert(msgs, ffi.string(buf))
   end
-  if #msgs == 0 then return 'unknown SSL error (empty queue)' end
-  return table.concat(msgs, '; ')
+  return #msgs > 0 and table.concat(msgs, '; ') or 'unknown SSL error'
 end
 
 local _ctx
@@ -99,101 +92,222 @@ local function get_ctx()
   if _ctx then return _ctx end
   libssl.OPENSSL_init_ssl(0, nil)
   local ctx = libssl.SSL_CTX_new(libssl.TLS_client_method())
-  if ctx == nil then error('SSL_CTX_new failed: ' .. ssl_err_string()) end
+  if ctx == nil then error('SSL_CTX_new: ' .. ssl_err_string()) end
   libssl.SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nil)
   _ctx = ctx
   return ctx
 end
 
--- ── TLS connection ────────────────────────────────────────────────────────────
+-- Drain ciphertext from net_bio and send via tcp
+local function flush_net_bio(ssl_conn)
+  local pending = libssl.BIO_ctrl(ssl_conn.net_bio, BIO_CTRL_PENDING, 0, nil)
+  while pending > 0 do
+    local buf = ffi.new('char[?]', pending)
+    local n   = libssl.BIO_read(ssl_conn.net_bio, buf, pending)
+    if n <= 0 then break end
+    ssl_conn.tcp:write(ffi.string(buf, n))
+    pending = libssl.BIO_ctrl(ssl_conn.net_bio, BIO_CTRL_PENDING, 0, nil)
+  end
+end
+
+-- ── TlsConn ───────────────────────────────────────────────────────────────────
 
 ---@class TlsConn
----@field ssl  cdata  SSL*
----@field tcp  uv_tcp_t
 local TlsConn = {}
 TlsConn.__index = TlsConn
 
---- Wrap an already-connected vim.uv TCP handle with TLS.
---- The handshake is synchronous (brief block during connection setup only).
----@param tcp  uv_tcp_t
----@param host string   server hostname for SNI
----@return TlsConn|nil, string|nil
-function M.wrap(tcp, host)
+--- Wrap a connected vim.uv TCP handle with TLS using memory BIOs.
+--- The handshake is asynchronous — on_ready(conn, err) is called when done.
+---@param tcp      uv_tcp_t
+---@param host     string
+---@param on_ready fun(conn: table|nil, err: string|nil)
+function M.wrap(tcp, host, on_ready)
   local ctx = get_ctx()
   local ssl = libssl.SSL_new(ctx)
   if ssl == nil then
-    return nil, 'SSL_new failed: ' .. ssl_err_string()
+    on_ready(nil, 'SSL_new: ' .. ssl_err_string())
+    return
   end
 
-  local fd, err = tcp:fileno()
-  if not fd or fd < 0 then
+  -- Create a BIO pair: ssl_bio ↔ net_bio
+  -- OpenSSL reads/writes ssl_bio; we read/write net_bio
+  local ssl_bio_p = ffi.new('BIO*[1]')
+  local net_bio_p = ffi.new('BIO*[1]')
+  local rc = libssl.BIO_new_bio_pair(ssl_bio_p, 0, net_bio_p, 0)
+  if rc ~= 1 then
     libssl.SSL_free(ssl)
-    return nil, 'fileno() failed: ' .. tostring(err)
+    on_ready(nil, 'BIO_new_bio_pair: ' .. ssl_err_string())
+    return
   end
 
-  libssl.SSL_set_fd(ssl, fd)
-  -- SSL_set_tlsext_host_name macro: SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME=55, TLSEXT_NAMETYPE_host_name=0, host)
+  local ssl_bio = ssl_bio_p[0]
+  local net_bio = net_bio_p[0]
+
+  -- SSL takes ownership of ssl_bio (both read and write sides)
+  libssl.SSL_set_bio(ssl, ssl_bio, ssl_bio)
+  libssl.SSL_set_connect_state(ssl)
+  -- SNI: SSL_CTRL_SET_TLSEXT_HOSTNAME=55, TLSEXT_NAMETYPE_host_name=0
   libssl.SSL_ctrl(ssl, 55, 0, ffi.cast('void *', ffi.cast('const char *', host)))
 
-  -- libuv sets the fd non-blocking; SSL_connect needs blocking I/O.
-  -- Set blocking for the handshake, restore non-blocking after.
-  set_blocking(fd, true)
-  local ret = libssl.SSL_connect(ssl)
-  set_blocking(fd, false)
+  local conn = setmetatable({
+    ssl     = ssl,
+    net_bio = net_bio,
+    tcp     = tcp,
+    _ready  = false,
+    _rbuf   = '',  -- plaintext read buffer
+  }, TlsConn)
 
-  if ret ~= 1 then
-    local ssl_err = libssl.SSL_get_error(ssl, ret)
-    local errmsg  = ssl_err_string()
-    libssl.SSL_free(ssl)
-    return nil, string.format('SSL_connect failed: ret=%d ssl_err=%d %s', ret, ssl_err, errmsg)
+  -- Start the async handshake
+  conn:_do_handshake(on_ready)
+end
+
+function TlsConn:_do_handshake(on_ready)
+  -- Drive the handshake state machine
+  local ret = libssl.SSL_do_handshake(self.ssl)
+  -- Always flush any output OpenSSL generated
+  flush_net_bio(self)
+
+  if ret == 1 then
+    -- Handshake complete
+    self._ready = true
+    self.tcp:read_stop()
+    on_ready(self, nil)
+    return
   end
 
-  return setmetatable({ ssl = ssl, tcp = tcp }, TlsConn), nil
+  local ssl_err = libssl.SSL_get_error(self.ssl, ret)
+  if ssl_err == SSL_ERROR_WANT_READ then
+    -- Need more data from the network; wait for tcp:read_start callback
+    self.tcp:read_start(function(err, data)
+      if err or not data then
+        self.tcp:read_stop()
+        on_ready(nil, 'handshake read: ' .. (err or 'EOF'))
+        return
+      end
+      -- Feed received ciphertext into net_bio
+      libssl.BIO_write(self.net_bio, data, #data)
+      -- Continue handshake
+      self:_do_handshake(on_ready)
+    end)
+    return
+  end
+
+  -- Real error
+  on_ready(nil, string.format('SSL_do_handshake: ssl_err=%d %s', ssl_err, ssl_err_string()))
+end
+
+--- Start reading plaintext from the TLS stream.
+--- Calls on_data(data) for each chunk, on_close(err) when connection ends.
+---@param on_data  fun(data: string)
+---@param on_close fun(err: string|nil)
+function TlsConn:read_start(on_data, on_close)
+  -- Drain any data already in SSL's buffer from the handshake
+  self:_drain_ssl(on_data)
+
+  self.tcp:read_start(function(err, data)
+    if err or not data then
+      self.tcp:read_stop()
+      on_close(err)
+      return
+    end
+    -- Feed ciphertext into net_bio, then drain plaintext from SSL
+    libssl.BIO_write(self.net_bio, data, #data)
+    self:_drain_ssl(on_data)
+  end)
+end
+
+function TlsConn:_drain_ssl(on_data)
+  local buf = ffi.new('char[16384]')
+  while true do
+    local n = libssl.SSL_read(self.ssl, buf, 16384)
+    if n > 0 then
+      on_data(ffi.string(buf, n))
+    else
+      local ssl_err = libssl.SSL_get_error(self.ssl, n)
+      if ssl_err == SSL_ERROR_WANT_READ or ssl_err == SSL_ERROR_WANT_WRITE then
+        break  -- no more data right now
+      end
+      if ssl_err == SSL_ERROR_ZERO_RETURN then
+        break  -- clean EOF, on_close will fire from tcp read_start
+      end
+      break
+    end
+  end
+end
+
+function TlsConn:read_stop()
+  self.tcp:read_stop()
 end
 
 ---@param data string
----@return boolean ok, string|nil errmsg
+---@return boolean ok, string|nil err
 function TlsConn:write(data)
   local ret = libssl.SSL_write(self.ssl, data, #data)
   if ret <= 0 then
-    return false, 'SSL_write failed: ' .. ssl_err_string()
+    return false, 'SSL_write: ' .. ssl_err_string()
   end
+  flush_net_bio(self)
   return true, nil
 end
 
-local SSL_ERROR_WANT_READ  = 2
-local SSL_ERROR_WANT_WRITE = 3
-local SSL_ERROR_ZERO_RETURN = 6  -- clean shutdown
-
+--- Synchronous read for short-lived RPC connections (paste/status/copy response).
+--- Only valid after handshake. Reads one SSL record worth of data.
 ---@param n integer
----@return string|nil data, string|nil errmsg, boolean|nil want_retry
-function TlsConn:read(n)
+---@return string|nil data, string|nil err
+function TlsConn:read_sync(n)
   local buf = ffi.new('char[?]', n)
+  -- Try immediately first (data may already be buffered)
   local ret = libssl.SSL_read(self.ssl, buf, n)
-  if ret > 0 then
-    return ffi.string(buf, ret), nil, false
-  end
-  local ssl_err = libssl.SSL_get_error(self.ssl, ret)
-  if ssl_err == SSL_ERROR_WANT_READ or ssl_err == SSL_ERROR_WANT_WRITE then
-    -- non-blocking: no data available yet, caller should wait for next poll event
-    return nil, nil, true
-  end
-  if ssl_err == SSL_ERROR_ZERO_RETURN then
-    return nil, 'connection closed', false
-  end
-  return nil, string.format('SSL_read failed: ssl_err=%d %s', ssl_err, ssl_err_string()), false
-end
+  if ret > 0 then return ffi.string(buf, ret), nil end
 
---- Return the underlying fd for use with vim.uv.new_poll().
----@return integer|nil
-function TlsConn:fd()
-  return self.tcp:fileno()
+  local ssl_err = libssl.SSL_get_error(self.ssl, ret)
+  if ssl_err ~= SSL_ERROR_WANT_READ and ssl_err ~= SSL_ERROR_WANT_WRITE then
+    return nil, 'SSL_read: ' .. ssl_err_string()
+  end
+
+  -- Need to do a synchronous (blocking) read from the tcp handle
+  -- For RPC connections we can use a coroutine-style wait via uv
+  local result, result_err
+  local done = false
+  self.tcp:read_start(function(err, data)
+    if done then return end
+    if err or not data then
+      result_err = err or 'EOF'
+      done = true
+      self.tcp:read_stop()
+      return
+    end
+    libssl.BIO_write(self.net_bio, data, #data)
+    local r = libssl.SSL_read(self.ssl, buf, n)
+    if r > 0 then
+      result = ffi.string(buf, r)
+      done   = true
+      self.tcp:read_stop()
+    end
+  end)
+
+  -- Spin the event loop until done
+  -- This is safe because we're in a vim.schedule callback
+  local deadline = vim.uv.now() + 5000
+  while not done do
+    vim.uv.run('nowait')
+    if vim.uv.now() > deadline then
+      self.tcp:read_stop()
+      return nil, 'read_sync timeout'
+    end
+  end
+
+  return result, result_err
 end
 
 function TlsConn:close()
-  if self.ssl ~= nil then
-    libssl.SSL_free(self.ssl)
+  if self.ssl then
+    libssl.SSL_free(self.ssl)  -- also frees ssl_bio
     self.ssl = nil
+  end
+  if self.net_bio then
+    libssl.BIO_free(self.net_bio)
+    self.net_bio = nil
   end
   pcall(function() self.tcp:close() end)
 end
