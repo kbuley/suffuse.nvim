@@ -33,7 +33,7 @@ ffi.cdef[[
   int      SSL_read(SSL *ssl, void *buf, int num);
   int      SSL_write(SSL *ssl, const void *buf, int num);
   int      SSL_get_error(SSL *ssl, int ret);
-  int      SSL_set_tlsext_host_name(SSL *ssl, const char *name);
+  long     SSL_ctrl(SSL *ssl, int cmd, long larg, void *parg);
 
   const void *TLS_client_method(void);
 
@@ -102,7 +102,8 @@ function M.wrap(tcp, host)
   end
 
   libssl.SSL_set_fd(ssl, fd)
-  libssl.SSL_set_tlsext_host_name(ssl, host)
+  -- SSL_set_tlsext_host_name is a macro: SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, host)
+  libssl.SSL_ctrl(ssl, 55, 0, ffi.cast('void *', ffi.cast('const char *', host)))
 
   local ret = libssl.SSL_connect(ssl)
   if ret ~= 1 then
