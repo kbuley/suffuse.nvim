@@ -8,12 +8,38 @@
 -- We skip certificate chain verification (SSL_CTX_set_verify NONE) because
 -- we cannot reproduce the HKDF key derivation in Lua. Traffic is still
 -- encrypted; the token in the Authorization header provides authentication.
+--
+-- libuv sets all TCP sockets to non-blocking mode. SSL_connect() requires the
+-- fd to be blocking (or a poll loop). We temporarily set the fd to blocking
+-- for the handshake via fcntl(F_SETFL), then restore it afterward.
 
 if not jit then
   return { available = false }
 end
 
 local ffi = require('ffi')
+
+-- ── libc (fcntl) ─────────────────────────────────────────────────────────────
+
+ffi.cdef[[
+  int fcntl(int fd, int cmd, ...);
+]]
+
+-- ffi.C gives access to symbols already in the process (libc is always loaded)
+local F_GETFL = 3
+local F_SETFL = 4
+local O_NONBLOCK = 2048  -- 0x800 on Linux/aarch64 and x86_64
+
+local function set_blocking(fd, blocking)
+  local flags = ffi.C.fcntl(fd, F_GETFL, 0)
+  if flags < 0 then return end
+  if blocking then
+    flags = bit.band(flags, bit.bnot(O_NONBLOCK))
+  else
+    flags = bit.bor(flags, O_NONBLOCK)
+  end
+  ffi.C.fcntl(fd, F_SETFL, ffi.cast('int', flags))
+end
 
 -- ── OpenSSL FFI declarations ─────────────────────────────────────────────────
 
@@ -99,7 +125,6 @@ function M.wrap(tcp, host)
     return nil, 'SSL_new failed: ' .. ssl_err_string()
   end
 
-  -- fileno() is the correct luv method (not getfd)
   local fd, err = tcp:fileno()
   if not fd or fd < 0 then
     libssl.SSL_free(ssl)
@@ -107,10 +132,15 @@ function M.wrap(tcp, host)
   end
 
   libssl.SSL_set_fd(ssl, fd)
-  -- SSL_set_tlsext_host_name is a macro: SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, host)
+  -- SSL_set_tlsext_host_name macro: SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME=55, TLSEXT_NAMETYPE_host_name=0, host)
   libssl.SSL_ctrl(ssl, 55, 0, ffi.cast('void *', ffi.cast('const char *', host)))
 
+  -- libuv sets the fd non-blocking; SSL_connect needs blocking I/O.
+  -- Set blocking for the handshake, restore non-blocking after.
+  set_blocking(fd, true)
   local ret = libssl.SSL_connect(ssl)
+  set_blocking(fd, false)
+
   if ret ~= 1 then
     local ssl_err = libssl.SSL_get_error(ssl, ret)
     local errmsg  = ssl_err_string()
@@ -145,8 +175,7 @@ end
 --- Return the underlying fd for use with vim.uv.new_poll().
 ---@return integer|nil
 function TlsConn:fd()
-  local fd = self.tcp:fileno()
-  return fd
+  return self.tcp:fileno()
 end
 
 function TlsConn:close()
