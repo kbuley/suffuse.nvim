@@ -122,7 +122,7 @@ TlsConn.__index = TlsConn
 ---@param host     string
 ---@param on_ready fun(conn: table|nil, err: string|nil)
 function M.wrap(tcp, host, on_ready)
-  vim.notify('[suffuse] tls.wrap called host=' .. tostring(host), vim.log.levels.WARN)
+  vim.schedule(function() vim.notify('[suffuse] tls.wrap called host=' .. tostring(host), vim.log.levels.WARN) end)
   local ctx = get_ctx()
   local ssl = libssl.SSL_new(ctx)
   if ssl == nil then
@@ -163,38 +163,32 @@ function M.wrap(tcp, host, on_ready)
 end
 
 function TlsConn:_do_handshake(on_ready)
-  -- Drive the handshake state machine
   local ret = libssl.SSL_do_handshake(self.ssl)
-  -- Always flush any output OpenSSL generated
   flush_net_bio(self)
 
   if ret == 1 then
-    -- Handshake complete
     self._ready = true
     self.tcp:read_stop()
-    on_ready(self, nil)
+    vim.schedule(function() on_ready(self, nil) end)
     return
   end
 
   local ssl_err = libssl.SSL_get_error(self.ssl, ret)
-  if ssl_err == SSL_ERROR_WANT_READ then
-    -- Need more data from the network; wait for tcp:read_start callback
+  if ssl_err == SSL_ERROR_WANT_READ or ssl_err == SSL_ERROR_WANT_WRITE then
     self.tcp:read_start(function(err, data)
       if err or not data then
         self.tcp:read_stop()
-        on_ready(nil, 'handshake read: ' .. (err or 'EOF'))
+        vim.schedule(function() on_ready(nil, 'handshake: ' .. (err or 'EOF')) end)
         return
       end
-      -- Feed received ciphertext into net_bio
       libssl.BIO_write(self.net_bio, data, #data)
-      -- Continue handshake
       self:_do_handshake(on_ready)
     end)
     return
   end
 
-  -- Real error
-  on_ready(nil, string.format('SSL_do_handshake: ssl_err=%d %s', ssl_err, ssl_err_string()))
+  local errmsg = string.format('SSL_do_handshake: ssl_err=%d %s', ssl_err, ssl_err_string())
+  vim.schedule(function() on_ready(nil, errmsg) end)
 end
 
 --- Start reading plaintext from the TLS stream.
@@ -202,18 +196,17 @@ end
 ---@param on_data  fun(data: string)
 ---@param on_close fun(err: string|nil)
 function TlsConn:read_start(on_data, on_close)
-  -- Drain any data already in SSL's buffer from the handshake
-  self:_drain_ssl(on_data)
+  -- Drain any plaintext already buffered in SSL from the handshake
+  vim.schedule(function() self:_drain_ssl(on_data) end)
 
   self.tcp:read_start(function(err, data)
     if err or not data then
       self.tcp:read_stop()
-      on_close(err)
+      vim.schedule(function() on_close(err) end)
       return
     end
-    -- Feed ciphertext into net_bio, then drain plaintext from SSL
     libssl.BIO_write(self.net_bio, data, #data)
-    self:_drain_ssl(on_data)
+    vim.schedule(function() self:_drain_ssl(on_data) end)
   end)
 end
 
