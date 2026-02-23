@@ -298,7 +298,8 @@ function Client:_start_watch_read(conn)
       return
     end
 
-    local chunk, rerr = conn:read(16384)
+    local chunk, rerr, retry = conn:read(16384)
+    if retry then return end  -- WANT_READ: no data yet, wait for next poll event
     if not chunk then
       poll:stop(); poll:close()
       self:_watch_disconnected(rerr or 'read error')

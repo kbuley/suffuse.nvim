@@ -161,15 +161,27 @@ function TlsConn:write(data)
   return true, nil
 end
 
+local SSL_ERROR_WANT_READ  = 2
+local SSL_ERROR_WANT_WRITE = 3
+local SSL_ERROR_ZERO_RETURN = 6  -- clean shutdown
+
 ---@param n integer
----@return string|nil data, string|nil errmsg
+---@return string|nil data, string|nil errmsg, boolean|nil want_retry
 function TlsConn:read(n)
   local buf = ffi.new('char[?]', n)
   local ret = libssl.SSL_read(self.ssl, buf, n)
-  if ret <= 0 then
-    return nil, 'SSL_read failed: ' .. ssl_err_string()
+  if ret > 0 then
+    return ffi.string(buf, ret), nil, false
   end
-  return ffi.string(buf, ret), nil
+  local ssl_err = libssl.SSL_get_error(self.ssl, ret)
+  if ssl_err == SSL_ERROR_WANT_READ or ssl_err == SSL_ERROR_WANT_WRITE then
+    -- non-blocking: no data available yet, caller should wait for next poll event
+    return nil, nil, true
+  end
+  if ssl_err == SSL_ERROR_ZERO_RETURN then
+    return nil, 'connection closed', false
+  end
+  return nil, string.format('SSL_read failed: ssl_err=%d %s', ssl_err, ssl_err_string()), false
 end
 
 --- Return the underlying fd for use with vim.uv.new_poll().
