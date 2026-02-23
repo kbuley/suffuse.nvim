@@ -22,6 +22,7 @@ function M.setup(user_opts)
   _client = require('suffuse.client').new(_cfg)
 
   _client:on_clipboard_update(function(text)
+    _client:set_latest_text(text)
     M._apply_paste(text)
   end)
 

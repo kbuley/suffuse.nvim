@@ -139,19 +139,14 @@ local function plugin_provider(get_client)
     end
   end
 
-  -- Paste does a synchronous fetch so it returns current server state
-  -- regardless of whether the watch stream has delivered an update yet.
-  -- vim.g.clipboard paste functions may be called from a blocking context
-  -- so we use read_sync via fetch_paste_sync on the client.
+  -- Paste returns the latest text received from the watch stream.
+  -- vim.g.clipboard paste fns are called synchronously by Neovim — no I/O
+  -- is possible here. The watch stream keeps _latest_text up to date.
   local function paste_fn()
     local client = get_client()
-    if not client or client:get_state() ~= 'connected' then
-      return { '' }, 'c'
-    end
-    local text = client:fetch_paste_sync()
-    if not text or text == '' then
-      return { '' }, 'c'
-    end
+    if not client then return { '' }, 'c' end
+    local text = client:get_latest_text()
+    if not text or text == '' then return { '' }, 'c' end
     return vim.split(text, '\n', { plain = true }), 'V'
   end
 

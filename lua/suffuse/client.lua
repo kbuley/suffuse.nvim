@@ -157,22 +157,17 @@ function Client:fetch_paste(cb)
   end)
 end
 
---- Synchronous paste fetch for use from vim.g.clipboard paste functions.
---- Spins the event loop until a result arrives (or timeout).
+--- Return the last clipboard text received from the watch stream.
+--- Used by the plugin-tier paste function which must return synchronously.
 ---@return string|nil
-function Client:fetch_paste_sync()
-  if self.state ~= STATE.CONNECTED then return nil end
-  local result, done = nil, false
-  self:fetch_paste(function(text, _err)
-    result = text
-    done   = true
-  end)
-  -- Spin the libuv event loop until the async fetch completes or 3s elapses
-  local deadline = vim.uv.now() + 3000
-  while not done and vim.uv.now() < deadline do
-    vim.uv.run('nowait')
-  end
-  return result
+function Client:get_latest_text()
+  return self._latest_text
+end
+
+--- Store the latest clipboard text (called by on_clipboard_update).
+---@param text string
+function Client:set_latest_text(text)
+  self._latest_text = text
 end
 
 function Client:fetch_status(cb)
