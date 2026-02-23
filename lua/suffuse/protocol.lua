@@ -106,11 +106,19 @@ function M.paste_request(host, token)
 end
 
 --- HTTP request for GET /v1/watch (opens a streaming response)
----@param host  string
----@param token string
+---@param host   string
+---@param token  string
+---@param source string
 ---@return string
-function M.watch_request(host, token)
-  return build_request('GET', '/v1/watch?clipboard=default&accepts=text%2Fplain', host, token, nil)
+function M.watch_request(host, token, source)
+  local path = '/v1/watch?clipboard=default&accepts=text%2Fplain'
+  local req  = build_request('GET', path, host, token, nil)
+  -- inject x-suffuse-source before the terminal CRLF so the server can
+  -- identify this peer separately from the copy/paste connections
+  if source and source ~= '' then
+    req = req:gsub('(\r\n\r\n)', '\r\nx-suffuse-source: ' .. source .. '%1', 1)
+  end
+  return req
 end
 
 --- HTTP request for GET /v1/status

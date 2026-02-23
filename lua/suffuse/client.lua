@@ -55,10 +55,8 @@ local function connect(host, port, cb)
         vim.schedule(function()
           if not conn then
             tcp:close()
-            vim.notify('[suffuse] tls.wrap failed: ' .. tostring(herr), vim.log.levels.WARN)
             cb(nil, herr)
           else
-            vim.notify('[suffuse] tls.wrap ok', vim.log.levels.WARN)
             cb(conn, nil)
           end
         end)
@@ -159,6 +157,24 @@ function Client:fetch_paste(cb)
   end)
 end
 
+--- Synchronous paste fetch for use from vim.g.clipboard paste functions.
+--- Spins the event loop until a result arrives (or timeout).
+---@return string|nil
+function Client:fetch_paste_sync()
+  if self.state ~= STATE.CONNECTED then return nil end
+  local result, done = nil, false
+  self:fetch_paste(function(text, _err)
+    result = text
+    done   = true
+  end)
+  -- Spin the libuv event loop until the async fetch completes or 3s elapses
+  local deadline = vim.uv.now() + 3000
+  while not done and vim.uv.now() < deadline do
+    vim.uv.run('nowait')
+  end
+  return result
+end
+
 function Client:fetch_status(cb)
   if self.state ~= STATE.CONNECTED then cb(nil, 'not connected'); return end
   local host = self.resolved_host
@@ -228,7 +244,7 @@ function Client:_open_watch(host)
       return
     end
 
-    local req    = proto.watch_request(host, self.cfg.token)
+    local req    = proto.watch_request(host, self.cfg.token, self.source)
     local ok, werr = conn:write(req)
     if not ok then
       conn:close()

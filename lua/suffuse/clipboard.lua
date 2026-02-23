@@ -132,24 +132,27 @@ end
 
 -- Plugin tier: pure Lua via the watch-stream client.
 local function plugin_provider(get_client)
-  local _sending = false
-
   local function copy_fn(lines, _)
-    if _sending then return end
     local client = get_client()
     if client and client:get_state() == 'connected' then
       client:send_text(table.concat(lines, '\n'))
     end
   end
 
+  -- Paste does a synchronous fetch so it returns current server state
+  -- regardless of whether the watch stream has delivered an update yet.
+  -- vim.g.clipboard paste functions may be called from a blocking context
+  -- so we use read_sync via fetch_paste_sync on the client.
   local function paste_fn()
-    _sending = true
-    local lines = vim.fn.getreg('+', 1, true)
-    if type(lines) == 'string' then
-      lines = vim.split(lines, '\n', { plain = true })
+    local client = get_client()
+    if not client or client:get_state() ~= 'connected' then
+      return { '' }, 'c'
     end
-    _sending = false
-    return lines, 'V'
+    local text = client:fetch_paste_sync()
+    if not text or text == '' then
+      return { '' }, 'c'
+    end
+    return vim.split(text, '\n', { plain = true }), 'V'
   end
 
   return {
