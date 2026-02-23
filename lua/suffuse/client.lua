@@ -312,13 +312,18 @@ end
 
 ---@param data string
 function Client:_on_watch_data(data)
+  vim.notify(string.format('[suffuse] watch data: headers=%s len=%d', tostring(self._watch_headers), #data), vim.log.levels.WARN)
   if not self._watch_headers then
     self._watch_buf = self._watch_buf .. data
     local status, _, rest = proto.parse_headers(self._watch_buf)
-    if not status then return end
+    if not status then
+      vim.notify('[suffuse] watch: headers incomplete, buffering', vim.log.levels.WARN)
+      return
+    end
 
     self._watch_headers = true
     self._watch_buf     = ''
+    vim.notify(string.format('[suffuse] watch: HTTP %d rest_len=%d', status, #rest), vim.log.levels.WARN)
 
     if status ~= 200 then
       vim.notify(string.format('[suffuse] watch HTTP %d', status), vim.log.levels.WARN)
@@ -332,6 +337,7 @@ function Client:_on_watch_data(data)
     self:_process_watch_body()
   else
     self._watch_body_buf = self._watch_body_buf .. data
+    vim.notify(string.format('[suffuse] watch body buf len=%d', #self._watch_body_buf), vim.log.levels.WARN)
     self:_process_watch_body()
   end
 end
