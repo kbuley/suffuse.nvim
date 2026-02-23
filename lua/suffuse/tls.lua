@@ -165,6 +165,7 @@ end
 function TlsConn:_do_handshake(on_ready)
   local ret = libssl.SSL_do_handshake(self.ssl)
   flush_net_bio(self)
+  vim.schedule(function() vim.notify(string.format('[suffuse] handshake ret=%d', ret), vim.log.levels.WARN) end)
 
   if ret == 1 then
     self._ready = true
@@ -174,6 +175,7 @@ function TlsConn:_do_handshake(on_ready)
   end
 
   local ssl_err = libssl.SSL_get_error(self.ssl, ret)
+  vim.schedule(function() vim.notify(string.format('[suffuse] handshake ssl_err=%d', ssl_err), vim.log.levels.WARN) end)
   if ssl_err == SSL_ERROR_WANT_READ or ssl_err == SSL_ERROR_WANT_WRITE then
     self.tcp:read_start(function(err, data)
       if err or not data then
@@ -181,6 +183,7 @@ function TlsConn:_do_handshake(on_ready)
         vim.schedule(function() on_ready(nil, 'handshake: ' .. (err or 'EOF')) end)
         return
       end
+      vim.schedule(function() vim.notify(string.format('[suffuse] handshake got %d bytes', #data), vim.log.levels.WARN) end)
       libssl.BIO_write(self.net_bio, data, #data)
       self:_do_handshake(on_ready)
     end)
