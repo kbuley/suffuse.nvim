@@ -49,7 +49,8 @@ local function connect(host, port, cb)
         return
       end
 
-      -- Async TLS handshake via memory BIOs + tcp:read_start
+      -- Must defer out of the connect callback before calling read_start
+      vim.schedule(function()
       tls.wrap(tcp, host, function(conn, herr)
         vim.schedule(function()
           if not conn then
@@ -62,6 +63,7 @@ local function connect(host, port, cb)
           end
         end)
       end)
+      end) -- vim.schedule
     end)
   end)
 end
