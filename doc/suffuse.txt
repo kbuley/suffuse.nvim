@@ -1,0 +1,192 @@
+*suffuse.txt*  Shared clipboard across machines, containers, and SSH sessions.
+
+                                                                    *suffuse*
+
+==============================================================================
+CONTENTS                                                   *suffuse-contents*
+
+  1. Introduction .................... |suffuse-intro|
+  2. Requirements .................... |suffuse-requirements|
+  3. Installation .................... |suffuse-installation|
+  4. Configuration ................... |suffuse-configuration|
+  5. Commands ........................ |suffuse-commands|
+  6. Keymaps ......................... |suffuse-keymaps|
+  7. Lua API ......................... |suffuse-api|
+
+==============================================================================
+1. INTRODUCTION                                               *suffuse-intro*
+
+suffuse.nvim connects Neovim to a running suffuse server, synchronising the
+system clipboard across machines, containers, and SSH sessions.
+
+The primary use case is Neovim running inside a container or remote machine,
+sharing a clipboard with the host and any other connected peers.
+
+The plugin connects to the suffuse gRPC-gateway over HTTPS/TLS on the same
+port as the gRPC server. A persistent streaming connection receives clipboard
+updates in real time; short-lived connections handle copy and status requests.
+
+TLS is implemented via LuaJIT FFI calling directly into OpenSSL — no external
+binaries, no shell-out, no compiled Neovim extensions required. The server
+uses a self-signed certificate derived from the shared token; traffic is
+always encrypted. The Bearer token in the Authorization header provides
+authentication when a non-default token is configured.
+
+Only text/plain is handled — images are filtered out intentionally.
+
+==============================================================================
+2. REQUIREMENTS                                        *suffuse-requirements*
+
+  - Neovim >= 0.9 built with LuaJIT (standard on all supported platforms)
+  - OpenSSL shared library (libssl) available at runtime
+  - A running suffuse server (see https://github.com/kbuley/suffuse)
+
+==============================================================================
+3. INSTALLATION                                        *suffuse-installation*
+
+lazy.nvim — works out of the box with no configuration: >lua
+
+  { 'kbuley/suffuse.nvim' }
+<
+
+lazy.nvim with options: >lua
+
+  {
+    'kbuley/suffuse.nvim',
+    opts = {
+      host  = '192.168.1.10',  -- override auto-probe
+      token = 'mysecret',
+      yank  = { register = '+' },
+    },
+  }
+<
+
+Manual setup: >lua
+
+  require('suffuse').setup({
+    host = 'host.docker.internal',
+    port = 8752,
+  })
+<
+
+To disable auto-setup: >lua
+
+  vim.g.suffuse_no_autosetup = true
+<
+
+==============================================================================
+4. CONFIGURATION                                      *suffuse-configuration*
+
+Pass options to |suffuse.setup()|. All fields are optional.
+
+Default configuration: >lua
+
+  require('suffuse').setup({
+    host         = nil,    -- nil = auto-probe (see HOST AUTO-PROBE below)
+    port         = 8752,
+    token        = '',     -- empty = default encryption, no bearer auth
+    auto_connect = true,   -- connect on VimEnter
+
+    -- Yank: send local yanks to the suffuse server
+    yank = {
+      enable   = true,  -- register TextYankPost autocmd
+      register = '"',   -- which register triggers a send (see below)
+    },
+
+    -- Paste: where incoming clipboard updates are written
+    paste = {
+      registers = { '+', '*' },
+    },
+  })
+<
+
+YANK.REGISTER VALUES~
+
+  `'"'`      Unnamed register — captures every yank and delete. Uses
+           vim.v.event.regcontents directly (no extra getreg call). Default.
+  `'+'`      System clipboard register only.
+  `'*'`      Primary selection register only.
+  `'prompt'` Ask via vim.ui.select() on every yank.
+
+PASTE.REGISTERS VALUES~
+
+Any combination of valid register names. Default `{ '+', '*' }` writes to
+both system clipboard registers. On macOS these are aliased so setting both
+is harmless.
+
+TOKEN / AUTHENTICATION~
+
+The `token` maps directly to the `--token` flag on the suffuse server. When
+set, it is sent as `Authorization: Bearer <token>` on every request. Traffic
+is always TLS-encrypted regardless of whether a token is set.
+
+HOST AUTO-PROBE~
+
+When `host` is nil, the plugin tries each address in order and uses the first
+that accepts a TCP connection:
+
+  1. `host.docker.internal`     Docker Desktop (macOS, Windows, Linux)
+  2. `host.containers.internal` Podman rootless
+  3. `localhost`                running directly on the host
+
+Once a host is resolved it is remembered for the session. Set `host`
+explicitly to skip probing entirely.
+
+==============================================================================
+5. COMMANDS                                               *suffuse-commands*
+
+:SuffuseConnect                                          *:SuffuseConnect*
+  Connect to the suffuse server (or reconnect if disconnected).
+
+:SuffuseDisconnect                                       *:SuffuseDisconnect*
+  Disconnect from the server and stop reconnecting.
+
+:SuffuseStatus                                           *:SuffuseStatus*
+  Show connection status and a list of connected peers in a floating window.
+  Press q or <Esc> to close.
+
+:SuffuseCopy [register]                                  *:SuffuseCopy*
+  Send the contents of [register] to the suffuse clipboard. If register is
+  omitted, uses `yank.register` from config. If `yank.register` is 'prompt',
+  opens a vim.ui.select() picker.
+
+:SuffusePaste                                            *:SuffusePaste*
+  Pull the latest clipboard from the server, write it to all configured
+  `paste.registers`, and insert it at the cursor position.
+
+==============================================================================
+6. KEYMAPS                                                *suffuse-keymaps*
+
+suffuse.nvim sets no keymaps by default. Example: >lua
+
+  vim.keymap.set({ 'n', 'v' }, '<leader>sc',
+    '<cmd>SuffuseCopy<cr>',
+    { desc = 'suffuse: copy to shared clipboard' })
+
+  vim.keymap.set('n', '<leader>sp',
+    '<cmd>SuffusePaste<cr>',
+    { desc = 'suffuse: paste from shared clipboard' })
+
+  vim.keymap.set('n', '<leader>ss',
+    '<cmd>SuffuseStatus<cr>',
+    { desc = 'suffuse: show status' })
+<
+
+==============================================================================
+7. LUA API                                                    *suffuse-api*
+
+require('suffuse').setup({opts})                         *suffuse.setup()*
+  Initialise the plugin. Idempotent — calling again with new opts disconnects
+  and reconnects with the updated configuration.
+
+require('suffuse').copy({reg})                           *suffuse.copy()*
+  Send register {reg} (or the configured default) to the server.
+
+require('suffuse').paste()                               *suffuse.paste()*
+  Pull the latest clipboard from the server and insert at cursor.
+
+require('suffuse').status()                              *suffuse.status()*
+  Show the status float (same as :SuffuseStatus).
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:
