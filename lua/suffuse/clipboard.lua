@@ -16,26 +16,31 @@ local M = {}
 
 -- ── Tier detection ────────────────────────────────────────────────────────────
 
---- Check if the suffuse daemon is reachable on localhost via a synchronous
---- TCP connect attempt. Uses vim.uv in a blocking loop so it can be called
---- at setup time before the event loop is running fully.
----@param port integer
+--- Check if the suffuse daemon is running by probing the IPC socket.
+--- Mirrors ipc.IsRunning() from the Go package.
 ---@return boolean
-local function daemon_reachable(port)
-  local reachable = false
-  local done      = false
-  local tcp       = vim.uv.new_tcp()
-  tcp:connect('127.0.0.1', port, function(err)
-    tcp:close()
-    reachable = not err
-    done      = true
+local function daemon_running()
+  local path = os.getenv('SUFFUSE_SOCKET')
+  if not path or path == '' then
+    path = (os.getenv('TMPDIR') or '/tmp') .. '/suffuse.sock'
+  end
+  -- Check the socket file exists first (cheap)
+  if vim.fn.filereadable(path) == 0 then return false end
+  -- Attempt a unix socket connect to confirm the daemon is alive
+  local ok = false
+  local done = false
+  local pipe = vim.uv.new_pipe(false)
+  pipe:connect(path, function(err)
+    ok   = not err
+    done = true
+    pcall(function() pipe:close() end)
   end)
-  -- Spin briefly — this resolves in <1ms on localhost
-  local deadline = vim.uv.now() + 500
+  local deadline = vim.uv.now() + 200
   while not done and vim.uv.now() < deadline do
     vim.uv.run('nowait')
   end
-  return reachable
+  if not done then pcall(function() pipe:close() end) end
+  return ok
 end
 
 --- Check if the suffuse binary exists on PATH.
@@ -53,7 +58,7 @@ function M.detect(cfg)
   if mode == 'off' then return 'off' end
 
   if mode == 'daemon' then
-    return daemon_reachable(cfg.port) and 'daemon' or 'off'
+    return daemon_running() and 'daemon' or 'off'
   end
 
   if mode == 'binary' then
@@ -64,9 +69,9 @@ function M.detect(cfg)
     return 'plugin'
   end
 
-  -- auto: daemon → binary → plugin
-  if daemon_reachable(cfg.port) then return 'daemon' end
-  if binary_path()              then return 'binary' end
+  -- auto: daemon (IPC socket) → binary → plugin
+  if daemon_running()  then return 'daemon' end
+  if binary_path()     then return 'binary' end
   return 'plugin'
 end
 
@@ -105,7 +110,10 @@ end
 ---@param get_client fun(): table|nil
 ---@return table
 local function plugin_provider(get_client)
+  local _sending = false  -- guard against paste-fn read triggering copy-fn
+
   local function copy_fn(lines, _regtype)
+    if _sending then return end
     local client = get_client()
     if client and client:get_state() == 'connected' then
       client:send_text(table.concat(lines, '\n'))
@@ -113,10 +121,10 @@ local function plugin_provider(get_client)
   end
 
   local function paste_fn()
-    -- The watch stream writes to '+' directly; return its current value.
-    -- For an explicit :SuffusePaste the user can still call that command.
+    _sending = true
     local lines = vim.fn.getreg('+', 1, true)
     if type(lines) == 'string' then lines = vim.split(lines, '\n', { plain = true }) end
+    _sending = false
     return lines, 'V'
   end
 
@@ -134,20 +142,13 @@ end
 ---@param get_client fun(): table|nil  fallback for paste register reads
 ---@return table
 local function daemon_provider(cfg, get_client)
-  -- For copy: POST to local daemon synchronously using vim.system (Neovim 0.10+)
-  -- or fall back to plugin_provider copy for older Neovim.
-  -- For paste: same as plugin — read the register the watch stream populated.
+  -- The binary finds the IPC socket itself ($TMPDIR/suffuse.sock or $SUFFUSE_SOCKET).
+  -- No host/port flags needed when the daemon is local.
+  local bin = binary_path()
 
-  if vim.system then
-    local bin   = binary_path()
-    local flags = { '--upstream=localhost:' .. cfg.port }
-    if cfg.token and cfg.token ~= '' then
-      table.insert(flags, '--token=' .. cfg.token)
-    end
-
+  if bin and vim.system then
     local function copy_fn(lines, _regtype)
-      local args = vim.list_extend({ bin or 'suffuse', 'copy' }, flags)
-      vim.system(args, { stdin = table.concat(lines, '\n') })
+      vim.system({ bin, 'copy' }, { stdin = table.concat(lines, '\n') })
     end
 
     local function paste_fn()
@@ -164,7 +165,7 @@ local function daemon_provider(cfg, get_client)
     }
   end
 
-  -- Neovim < 0.10: fall back to plugin provider
+  -- No binary or Neovim < 0.10: fall back to plugin provider
   return plugin_provider(get_client)
 end
 

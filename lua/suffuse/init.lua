@@ -3,9 +3,10 @@
 
 local M = {}
 
-local _client  = nil ---@type SuffuseClient|nil
-local _cfg     = nil ---@type table|nil
-local _augroup = nil ---@type integer|nil
+local _client   = nil ---@type SuffuseClient|nil
+local _cfg      = nil ---@type table|nil
+local _augroup  = nil ---@type integer|nil
+local _applying = false  -- guard against re-entrant watch→setreg→yank→send loop
 
 -- ── Setup ─────────────────────────────────────────────────────────────────────
 
@@ -58,6 +59,7 @@ function M._setup_autocmds()
     desc     = 'suffuse: send yank to clipboard server',
     callback = function()
       if not _client then return end
+      if _applying then return end  -- remote update is writing registers, don't echo back
       local reg = _cfg.yank.register
 
       if reg == 'prompt' then
@@ -189,9 +191,12 @@ end
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 
 function M._apply_paste(text)
+  if _applying then return end
+  _applying = true
   for _, reg in ipairs(_cfg.paste.registers) do
     vim.fn.setreg(reg, text)
   end
+  _applying = false
 end
 
 function M._prompt_and_send()

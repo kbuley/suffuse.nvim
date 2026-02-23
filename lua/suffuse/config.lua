@@ -5,10 +5,11 @@ local M = {}
 
 --- Hosts tried in order when config.host is nil.
 --- First successful TCP connection wins and is remembered for the session.
+--- localhost is first so that a local daemon is preferred over the remote host.
 M.DEFAULT_HOSTS = {
+  'localhost',                -- local suffuse daemon (preferred)
   'host.docker.internal',     -- Docker Desktop (macOS, Windows, Docker Desktop Linux)
   'host.containers.internal', -- Podman rootless
-  'localhost',                -- running directly on the host
 }
 
 M.defaults = {
